@@ -170,6 +170,12 @@ pub enum SourceCreationError {
 
     #[error("Couldn't truncate the temporary file for newline trimming")]
     TempFileTruncate(#[source] io::Error),
+
+    #[error("Couldn't create the memfd file")]
+    MemFdFileCreate,
+
+    #[error("Couldn't seal the memfd file")]
+    MemFdFileSeal,
 }
 
 /// Errors that can occur for copying and clearing the clipboard.
@@ -245,6 +251,14 @@ struct State {
     serve_requests: ServeRequests,
     // An error that occurred while serving a request, if any.
     error: Option<DataSourceError>,
+    // Keep in-memory files open so they aren't dropped
+    memfd_files: Vec<File>,
+}
+
+struct FileSource {
+    mime_type: String,
+    data_path: PathBuf,
+    file: File,
 }
 
 delegate_dispatch!(State: [WlSeat: ()] => common::State);
@@ -537,14 +551,21 @@ impl PreparedCopy {
             };
             dropped.insert(data_path.clone());
 
-            match remove_file(&data_path).map_err(Error::TempFileRemove) {
-                Ok(()) => {
-                    data_path.pop();
-                    results.push(remove_dir(&data_path).map_err(Error::TempDirRemove));
+            if !cfg!(feature = "memfd") {
+                match remove_file(&data_path).map_err(Error::TempFileRemove) {
+                    Ok(()) => {
+                        data_path.pop();
+                        results.push(remove_dir(&data_path).map_err(Error::TempDirRemove));
+                    }
+                    result @ Err(_) => results.push(result),
                 }
-                result @ Err(_) => results.push(result),
+            } else {
+                data_path.pop();
+                results.push(Ok(()));
             }
         }
+
+        self.state.memfd_files.clear();
 
         // Return the error, if any.
         let result: Result<(), _> = results.into_iter().collect();
@@ -559,28 +580,87 @@ impl PreparedCopy {
     }
 }
 
+#[cfg(feature = "memfd")]
 fn make_source(
     source: Source,
     mime_type: MimeType,
     trim_newline: bool,
-) -> Result<(String, PathBuf), SourceCreationError> {
+) -> Result<FileSource, SourceCreationError> {
+    use {
+        memfd::{FileSeal, Memfd, MemfdOptions},
+        std::os::unix::io::AsRawFd,
+    };
+
+    let memfd_file = MemfdOptions::default()
+        .allow_sealing(true)
+        .close_on_exec(true)
+        .create("wl-clipboard")
+        .map_err(|_| SourceCreationError::MemFdFileCreate)?;
+    let temp_filename = PathBuf::from(format!("/proc/self/fd/{}", memfd_file.as_raw_fd()));
+
+    let mime_type = get_file_mime_type(&temp_filename, mime_type)?;
+
+    let mut temp_file = memfd_file.into_file();
+
+    write_source_to_file(
+        source,
+        trim_newline,
+        &mut temp_file,
+        &temp_filename,
+        &mime_type,
+    )?;
+
+    let memfd_file =
+        Memfd::try_from_file(temp_file).map_err(|_| SourceCreationError::MemFdFileCreate)?;
+
+    memfd_file
+        .add_seals(&[
+            FileSeal::SealWrite,
+            FileSeal::SealGrow,
+            FileSeal::SealShrink,
+            FileSeal::SealSeal,
+        ])
+        .map_err(|_| SourceCreationError::MemFdFileSeal)?;
+
+    Ok(FileSource {
+        mime_type,
+        data_path: temp_filename.to_path_buf(),
+        file: memfd_file.into_file(),
+    })
+}
+
+#[cfg(not(feature = "memfd"))]
+fn make_source(
+    source: Source,
+    mime_type: MimeType,
+    trim_newline: bool,
+) -> Result<FileSource, SourceCreationError> {
     let temp_dir = tempfile::tempdir().map_err(SourceCreationError::TempDirCreate)?;
     let mut temp_filename = temp_dir.into_path();
     temp_filename.push("stdin");
     trace!("Temp filename: {}", temp_filename.to_string_lossy());
     let mut temp_file =
         File::create(&temp_filename).map_err(SourceCreationError::TempFileCreate)?;
+    let mime_type = get_file_mime_type(&temp_filename, mime_type)?;
+    write_source_to_file(
+        source,
+        trim_newline,
+        &mut temp_file,
+        &temp_filename,
+        &mime_type,
+    )?;
+    Ok(FileSource {
+        mime_type,
+        data_path: temp_filename.to_path_buf(),
+        file: temp_file,
+    })
+}
 
-    if let Source::Bytes(data) = source {
-        temp_file
-            .write_all(&data)
-            .map_err(SourceCreationError::TempFileWrite)?;
-    } else {
-        // Copy the standard input into the target file.
-        io::copy(&mut io::stdin(), &mut temp_file).map_err(SourceCreationError::DataCopy)?;
-    }
-
-    let mime_type = match mime_type {
+fn get_file_mime_type(
+    temp_filename: &PathBuf,
+    mime_type: MimeType,
+) -> Result<String, SourceCreationError> {
+    let mime_type_str = match mime_type {
         MimeType::Autodetect => match tree_magic_mini::from_filepath(&temp_filename) {
             Some(magic) => Ok(magic),
             None => Err(SourceCreationError::TempFileOpen(std::io::Error::new(
@@ -592,8 +672,25 @@ fn make_source(
         MimeType::Text => "text/plain".to_string(),
         MimeType::Specific(mime_type) => mime_type,
     };
+    trace!("Base MIME type: {}", mime_type_str);
+    Ok(mime_type_str)
+}
 
-    trace!("Base MIME type: {}", mime_type);
+fn write_source_to_file(
+    source: Source,
+    trim_newline: bool,
+    temp_file: &mut File,
+    temp_filename: &PathBuf,
+    mime_type: &str,
+) -> Result<(), SourceCreationError> {
+    if let Source::Bytes(data) = source {
+        temp_file
+            .write_all(&data)
+            .map_err(SourceCreationError::TempFileWrite)?;
+    } else {
+        // Copy the standard input into the target file.
+        io::copy(&mut io::stdin(), temp_file).map_err(SourceCreationError::DataCopy)?;
+    }
 
     // Trim the trailing newline if needed.
     if trim_newline && is_text(&mime_type) {
@@ -622,8 +719,7 @@ fn make_source(
             }
         }
     }
-
-    Ok((mime_type, temp_filename))
+    Ok(())
 }
 
 fn get_devices(
@@ -653,6 +749,7 @@ fn get_devices(
         data_paths: HashMap::new(),
         serve_requests: ServeRequests::default(),
         error: None,
+        memfd_files: vec![],
     };
 
     // Retrieve all seat names.
@@ -861,18 +958,26 @@ fn prepare_copy_internal(
     state.data_paths = {
         let mut data_paths = HashMap::new();
         let mut text_data_path = None;
+
         for MimeSource { source, mime_type } in sources.into_iter() {
-            let (mime_type, mut data_path) =
-                make_source(source, mime_type, trim_newline).map_err(Error::TempCopy)?;
+            let FileSource {
+                mime_type,
+                mut data_path,
+                file,
+            } = make_source(source, mime_type, trim_newline).map_err(Error::TempCopy)?;
 
             let mime_type_is_text = is_text(&mime_type);
 
             match data_paths.entry(mime_type) {
                 Entry::Occupied(_) => {
-                    // This MIME type has already been specified, so ignore it.
-                    remove_file(&*data_path).map_err(Error::TempFileRemove)?;
-                    data_path.pop();
-                    remove_dir(&*data_path).map_err(Error::TempDirRemove)?;
+                    if !cfg!(feature = "memfd") {
+                        // This MIME type has already been specified, so ignore it.
+                        remove_file(&*data_path).map_err(Error::TempFileRemove)?;
+                        data_path.pop();
+                        remove_dir(&*data_path).map_err(Error::TempDirRemove)?;
+                    } else {
+                        data_path.pop();
+                    }
                 }
                 Entry::Vacant(entry) => {
                     if !options.omit_additional_text_mime_types
@@ -883,6 +988,9 @@ fn prepare_copy_internal(
                     }
 
                     entry.insert(data_path);
+                    if cfg!(feature = "memfd") {
+                        state.memfd_files.push(file);
+                    }
                 }
             }
         }
