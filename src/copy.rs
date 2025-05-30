@@ -171,11 +171,17 @@ pub enum SourceCreationError {
     #[error("Couldn't truncate the temporary file for newline trimming")]
     TempFileTruncate(#[source] io::Error),
 
+    #[cfg(feature = "memfd")]
     #[error("Couldn't create the memfd file")]
-    MemFdFileCreate,
+    MemFdFileCreate(#[source] memfd::Error),
 
+    #[cfg(feature = "memfd")]
     #[error("Couldn't seal the memfd file")]
-    MemFdFileSeal,
+    MemFdFileSeal(#[source] memfd::Error),
+
+    #[cfg(feature = "memfd")]
+    #[error("File is not compatible with memfd")]
+    MemFdFileNotCompatible,
 }
 
 /// Errors that can occur for copying and clearing the clipboard.
@@ -595,7 +601,7 @@ fn make_source(
         .allow_sealing(true)
         .close_on_exec(true)
         .create("wl-clipboard")
-        .map_err(|_| SourceCreationError::MemFdFileCreate)?;
+        .map_err(SourceCreationError::MemFdFileCreate)?;
     let temp_filename = PathBuf::from(format!("/proc/self/fd/{}", memfd_file.as_raw_fd()));
 
     let mime_type = get_file_mime_type(&temp_filename, mime_type)?;
@@ -611,7 +617,7 @@ fn make_source(
     )?;
 
     let memfd_file =
-        Memfd::try_from_file(temp_file).map_err(|_| SourceCreationError::MemFdFileCreate)?;
+        Memfd::try_from_file(temp_file).map_err(|_| SourceCreationError::MemFdFileNotCompatible)?;
 
     memfd_file
         .add_seals(&[
@@ -620,7 +626,7 @@ fn make_source(
             FileSeal::SealShrink,
             FileSeal::SealSeal,
         ])
-        .map_err(|_| SourceCreationError::MemFdFileSeal)?;
+        .map_err(SourceCreationError::MemFdFileSeal)?;
 
     Ok(FileSource {
         mime_type,
