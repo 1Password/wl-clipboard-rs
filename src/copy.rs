@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{remove_dir, remove_file, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 use std::{iter, thread};
 
@@ -557,7 +557,10 @@ impl PreparedCopy {
             };
             dropped.insert(data_path.clone());
 
-            if !cfg!(feature = "memfd") {
+            if cfg!(feature = "memfd") {
+                data_path.pop();
+                results.push(Ok(()));
+            } else {
                 match remove_file(&data_path).map_err(Error::TempFileRemove) {
                     Ok(()) => {
                         data_path.pop();
@@ -565,9 +568,6 @@ impl PreparedCopy {
                     }
                     result @ Err(_) => results.push(result),
                 }
-            } else {
-                data_path.pop();
-                results.push(Ok(()));
             }
         }
 
@@ -663,7 +663,7 @@ fn make_source(
 }
 
 fn get_file_mime_type(
-    temp_filename: &PathBuf,
+    temp_filename: &Path,
     mime_type: MimeType,
 ) -> Result<String, SourceCreationError> {
     let mime_type_str = match mime_type {
@@ -976,13 +976,13 @@ fn prepare_copy_internal(
 
             match data_paths.entry(mime_type) {
                 Entry::Occupied(_) => {
-                    if !cfg!(feature = "memfd") {
+                    if cfg!(feature = "memfd") {
+                        data_path.pop();
+                    } else {
                         // This MIME type has already been specified, so ignore it.
                         remove_file(&*data_path).map_err(Error::TempFileRemove)?;
                         data_path.pop();
                         remove_dir(&*data_path).map_err(Error::TempDirRemove)?;
-                    } else {
-                        data_path.pop();
                     }
                 }
                 Entry::Vacant(entry) => {
