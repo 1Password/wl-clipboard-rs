@@ -354,7 +354,7 @@ impl_dispatch_source!(State, |state: &mut Self,
                     FileSourceInner::TempFile { file, .. } => file,
                 };
                 // Clear O_NONBLOCK, otherwise io::copy() will stop halfway.
-                fcntl_setfl(&mut *source_file, OFlags::empty())
+                fcntl_setfl(&fd, OFlags::empty())
                     .map_err(io::Error::from)
                     .map_err(DataSourceError::Copy)?;
 
@@ -670,8 +670,15 @@ fn make_source(
     let mut temp_filename = temp_dir.into_path();
     temp_filename.push("stdin");
     trace!("Temp filename: {}", temp_filename.to_string_lossy());
-    let mut temp_file =
-        File::create(&temp_filename).map_err(SourceCreationError::TempFileCreate)?;
+    // Open the resulting FD as R+W so that both writing the source, and
+    // later copying it out to a destination, work as intended.
+    let mut temp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp_filename)
+        .map_err(SourceCreationError::TempFileCreate)?;
     let mime_type = get_file_mime_type(&temp_file, mime_type)?;
 
     let pinned_file = PinnedFile {
@@ -759,7 +766,13 @@ fn write_source_to_file(
             }
         }
     }
-    Ok(())
+
+    // Restore its offset to the start so that
+    // future reads see the previously-written data.
+    output_place
+        .seek(SeekFrom::Start(0))
+        .map(drop)
+        .map_err(SourceCreationError::TempFileSeek)
 }
 
 fn get_devices(
