@@ -179,10 +179,6 @@ pub enum SourceCreationError {
     #[cfg(feature = "memfd")]
     #[error("Couldn't seal the memfd file")]
     MemFdFileSeal(#[source] memfd::Error),
-
-    #[cfg(feature = "memfd")]
-    #[error("File is not compatible with memfd")]
-    MemFdFileNotCompatible,
 }
 
 /// Errors that can occur for copying and clearing the clipboard.
