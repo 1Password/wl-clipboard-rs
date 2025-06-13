@@ -3,9 +3,10 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs::{remove_dir, remove_file, File, OpenOptions};
+use std::fs::{remove_dir_all, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::mpsc::sync_channel;
 use std::{iter, thread};
 
@@ -170,6 +171,10 @@ pub enum SourceCreationError {
 
     #[error("Couldn't truncate the temporary file for newline trimming")]
     TempFileTruncate(#[source] io::Error),
+
+    #[cfg(feature = "memfd")]
+    #[error("Couldn't create and setup the memfd file")]
+    MemFdFileCreate(#[source] io::Error),
 }
 
 /// Errors that can occur for copying and clearing the clipboard.
@@ -241,10 +246,39 @@ struct State {
     // This bool can be set to true when serving a request: either if an error occurs, or if the
     // number of requests to serve was limited and the last request was served.
     should_quit: bool,
-    data_paths: HashMap<String, PathBuf>,
+    data_sources: HashMap<String, FileSourceInner>,
     serve_requests: ServeRequests,
     // An error that occurred while serving a request, if any.
     error: Option<DataSourceError>,
+}
+
+enum FileSourceInner {
+    #[cfg(feature = "memfd")]
+    InMemory(File),
+    TempFile {
+        file: File,
+        path: PathBuf,
+    },
+}
+
+impl FileSourceInner {
+    fn duplicate(&self) -> Self {
+        match self {
+            #[cfg(feature = "memfd")]
+            Self::InMemory(file) => {
+                Self::InMemory(file.try_clone().expect("unable to clone FD we created"))
+            }
+            Self::TempFile { file, path } => Self::TempFile {
+                file: file.try_clone().expect("unable to clone FD we created"),
+                path: path.clone(),
+            },
+        }
+    }
+}
+
+struct FileSource {
+    mime_type: String,
+    source: FileSourceInner,
 }
 
 delegate_dispatch!(State: [WlSeat: ()] => common::State);
@@ -298,24 +332,29 @@ impl_dispatch_source!(State, |state: &mut Self,
 
             // I'm not sure if it's the compositor's responsibility to check that the mime type is
             // valid. Let's check here just in case.
-            if !state.data_paths.contains_key(&mime_type) {
-                return;
-            }
+            let data_source = match state.data_sources.get_mut(&mime_type) {
+                Some(source) => source,
+                None => {
+                    return;
+                }
+            };
 
-            let data_path = &state.data_paths[&mime_type];
-
-            let file = File::open(data_path).map_err(DataSourceError::FileOpen);
-            let result = file.and_then(|mut data_file| {
+            let copy_result = || {
+                let source_file = match data_source {
+                    #[cfg(feature = "memfd")]
+                    FileSourceInner::InMemory(file) => file,
+                    FileSourceInner::TempFile { file, .. } => file,
+                };
                 // Clear O_NONBLOCK, otherwise io::copy() will stop halfway.
                 fcntl_setfl(&fd, OFlags::empty())
                     .map_err(io::Error::from)
                     .map_err(DataSourceError::Copy)?;
 
                 let mut target_file = File::from(fd);
-                io::copy(&mut data_file, &mut target_file).map_err(DataSourceError::Copy)
-            });
+                io::copy(source_file, &mut target_file).map_err(DataSourceError::Copy)
+            };
 
-            if let Err(err) = result {
+            if let Err(err) = copy_result() {
                 state.error = Some(err);
             }
 
@@ -529,20 +568,28 @@ impl PreparedCopy {
         // We want to try cleaning up all files and folders, so if any errors occur in process,
         // collect them into a vector without interruption, and then return the first one.
         let mut results = Vec::new();
-        let mut dropped = HashSet::new();
-        for data_path in self.state.data_paths.values_mut() {
-            // data_paths can contain duplicate items, we want to free each only once.
-            if dropped.contains(data_path) {
-                continue;
-            };
-            dropped.insert(data_path.clone());
-
-            match remove_file(&data_path).map_err(Error::TempFileRemove) {
-                Ok(()) => {
-                    data_path.pop();
-                    results.push(remove_dir(&data_path).map_err(Error::TempDirRemove));
+        let mut disk_source_dropped = HashSet::new();
+        for data_source in self.state.data_sources.into_values() {
+            match data_source {
+                // memfd is reference counted, there's no chance of closing something twice.
+                #[cfg(feature = "memfd")]
+                FileSourceInner::InMemory(file) => {
+                    drop(file);
+                    results.push(Ok(()));
                 }
-                result @ Err(_) => results.push(result),
+                FileSourceInner::TempFile { file, mut path } => {
+                    drop(file);
+                    path.pop();
+                    // `data_sources` can contain the same source for many mimes, but we want to free each once.
+                    // As every temporary file is under a different `$TMPDIR/` subdirectory, we are
+                    // able to dedup based of the subdirectory instead.
+                    if disk_source_dropped.contains(&path) {
+                        continue;
+                    };
+
+                    results.push(remove_dir_all(&path).map_err(Error::TempDirRemove));
+                    disk_source_dropped.insert(path);
+                }
             }
         }
 
@@ -559,29 +606,103 @@ impl PreparedCopy {
     }
 }
 
+#[cfg(feature = "memfd")]
 fn make_source(
     source: Source,
     mime_type: MimeType,
     trim_newline: bool,
-) -> Result<(String, PathBuf), SourceCreationError> {
+) -> Result<FileSource, SourceCreationError> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+
+    use memfd::{Error, FileSeal, Memfd, MemfdOptions};
+
+    fn extract_fd_error(err: memfd::Error) -> SourceCreationError {
+        match err {
+            Error::Create(e) | Error::AddSeals(e) | Error::GetSeals(e) => {
+                SourceCreationError::MemFdFileCreate(e)
+            }
+        }
+    }
+
+    let memfd_file = MemfdOptions::default()
+        .allow_sealing(true)
+        .close_on_exec(true)
+        .create("wl-clipboard")
+        .map_err(extract_fd_error)?;
+
+    let mut memfd_file = memfd_file.into_file();
+    let mime_type = get_file_mime_type(&memfd_file, mime_type)?;
+    let pinned_file = PinnedFile {
+        inner: &mut memfd_file,
+        _pinned: std::marker::PhantomPinned,
+    };
+    let pinned_file = std::pin::pin!(pinned_file);
+
+    write_source_to_file(source, trim_newline, pinned_file, &mime_type)?;
+
+    // SAFETY: Created by `memfd` above and we know nothing in-between
+    // swapped out the underlying file descriptor.
+    #[allow(unsafe_code)]
+    let memfd_file = unsafe { Memfd::from_raw_fd(memfd_file.into_raw_fd()) };
+
+    memfd_file
+        .add_seals(&[
+            FileSeal::SealWrite,
+            FileSeal::SealGrow,
+            FileSeal::SealShrink,
+            FileSeal::SealSeal,
+        ])
+        .map_err(extract_fd_error)?;
+
+    Ok(FileSource {
+        mime_type,
+        source: FileSourceInner::InMemory(memfd_file.into_file()),
+    })
+}
+
+#[cfg(not(feature = "memfd"))]
+fn make_source(
+    source: Source,
+    mime_type: MimeType,
+    trim_newline: bool,
+) -> Result<FileSource, SourceCreationError> {
     let temp_dir = tempfile::tempdir().map_err(SourceCreationError::TempDirCreate)?;
     let mut temp_filename = temp_dir.into_path();
     temp_filename.push("stdin");
     trace!("Temp filename: {}", temp_filename.to_string_lossy());
-    let mut temp_file =
-        File::create(&temp_filename).map_err(SourceCreationError::TempFileCreate)?;
+    // Open the resulting FD as R+W so that both writing the source, and
+    // later copying it out to a destination, work as intended.
+    let mut temp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp_filename)
+        .map_err(SourceCreationError::TempFileCreate)?;
+    let mime_type = get_file_mime_type(&temp_file, mime_type)?;
 
-    if let Source::Bytes(data) = source {
-        temp_file
-            .write_all(&data)
-            .map_err(SourceCreationError::TempFileWrite)?;
-    } else {
-        // Copy the standard input into the target file.
-        io::copy(&mut io::stdin(), &mut temp_file).map_err(SourceCreationError::DataCopy)?;
-    }
+    let pinned_file = PinnedFile {
+        inner: &mut temp_file,
+        _pinned: std::marker::PhantomPinned,
+    };
+    let pinned_file = std::pin::pin!(pinned_file);
 
-    let mime_type = match mime_type {
-        MimeType::Autodetect => match tree_magic_mini::from_filepath(&temp_filename) {
+    write_source_to_file(source, trim_newline, pinned_file, &mime_type)?;
+    Ok(FileSource {
+        mime_type,
+        source: FileSourceInner::TempFile {
+            file: temp_file,
+            path: temp_filename,
+        },
+    })
+}
+
+fn get_file_mime_type(
+    source_file: &File,
+    mime_type: MimeType,
+) -> Result<String, SourceCreationError> {
+    let mime_type_str = match mime_type {
+        MimeType::Autodetect => match tree_magic_mini::from_file(source_file) {
             Some(magic) => Ok(magic),
             None => Err(SourceCreationError::TempFileOpen(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -592,38 +713,66 @@ fn make_source(
         MimeType::Text => "text/plain".to_string(),
         MimeType::Specific(mime_type) => mime_type,
     };
+    trace!("Base MIME type: {}", mime_type_str);
+    Ok(mime_type_str)
+}
 
-    trace!("Base MIME type: {}", mime_type);
+// A wrapper which helps force proper `unsafe` annotations
+// to ensure FDs don't get swapped out by `write_source_to_file`
+// in order to soundly re-consume the FD after.
+struct PinnedFile<'a> {
+    inner: &'a mut File,
+    _pinned: std::marker::PhantomPinned,
+}
+
+fn write_source_to_file(
+    source: Source,
+    trim_newline: bool,
+    output_place: Pin<&mut PinnedFile>,
+    mime_type: &str,
+) -> Result<(), SourceCreationError> {
+    // SAFETY: We only write to the file, we never replace it.
+    #[allow(unsafe_code)]
+    let output_place = unsafe { &mut *output_place.get_unchecked_mut().inner };
+
+    if let Source::Bytes(data) = source {
+        output_place
+            .write_all(&data)
+            .map_err(SourceCreationError::TempFileWrite)?;
+    } else {
+        // Copy the standard input into the target file.
+        io::copy(&mut io::stdin(), output_place).map_err(SourceCreationError::DataCopy)?;
+    }
 
     // Trim the trailing newline if needed.
-    if trim_newline && is_text(&mime_type) {
-        let mut temp_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&temp_filename)
-            .map_err(SourceCreationError::TempFileOpen)?;
-        let metadata = temp_file
+    if trim_newline && is_text(mime_type) {
+        let metadata = output_place
             .metadata()
             .map_err(SourceCreationError::TempFileMetadata)?;
         let length = metadata.len();
         if length > 0 {
-            temp_file
+            output_place
                 .seek(SeekFrom::End(-1))
                 .map_err(SourceCreationError::TempFileSeek)?;
 
             let mut buf = [0];
-            temp_file
+            output_place
                 .read_exact(&mut buf)
                 .map_err(SourceCreationError::TempFileRead)?;
             if buf[0] == b'\n' {
-                temp_file
+                output_place
                     .set_len(length - 1)
                     .map_err(SourceCreationError::TempFileTruncate)?;
             }
         }
     }
 
-    Ok((mime_type, temp_filename))
+    // Restore its offset to the start so that
+    // future reads see the previously-written data.
+    output_place
+        .seek(SeekFrom::Start(0))
+        .map(drop)
+        .map_err(SourceCreationError::TempFileSeek)
 }
 
 fn get_devices(
@@ -650,7 +799,7 @@ fn get_devices(
         common,
         got_primary_selection: false,
         should_quit: false,
-        data_paths: HashMap::new(),
+        data_sources: HashMap::new(),
         serve_requests: ServeRequests::default(),
         error: None,
     };
@@ -858,37 +1007,44 @@ fn prepare_copy_internal(
     state.serve_requests = serve_requests;
 
     // Collect the source data to copy.
-    state.data_paths = {
-        let mut data_paths = HashMap::new();
-        let mut text_data_path = None;
+    state.data_sources = {
+        let mut data_sources = HashMap::new();
+        let mut text_data = None;
+
         for MimeSource { source, mime_type } in sources.into_iter() {
-            let (mime_type, mut data_path) =
+            let FileSource { mime_type, source } =
                 make_source(source, mime_type, trim_newline).map_err(Error::TempCopy)?;
 
-            let mime_type_is_text = is_text(&mime_type);
-
-            match data_paths.entry(mime_type) {
+            match data_sources.entry(mime_type) {
                 Entry::Occupied(_) => {
                     // This MIME type has already been specified, so ignore it.
-                    remove_file(&*data_path).map_err(Error::TempFileRemove)?;
-                    data_path.pop();
-                    remove_dir(&*data_path).map_err(Error::TempDirRemove)?;
+                    match source {
+                        #[cfg(feature = "memfd")]
+                        FileSourceInner::InMemory(file) => drop(file),
+                        FileSourceInner::TempFile { file, mut path, .. } => {
+                            // Be explicit during cleanup.
+                            drop(file);
+                            // Get the tempdir parent created prior.
+                            path.pop();
+                            remove_dir_all(path).map_err(Error::TempFileRemove)?;
+                        }
+                    }
                 }
                 Entry::Vacant(entry) => {
                     if !options.omit_additional_text_mime_types
-                        && text_data_path.is_none()
-                        && mime_type_is_text
+                        && text_data.is_none()
+                        && is_text(entry.key())
                     {
-                        text_data_path = Some(data_path.clone());
+                        text_data = Some((entry.into_key(), source));
+                    } else {
+                        entry.insert(source);
                     }
-
-                    entry.insert(data_path);
                 }
             }
         }
 
         // If the MIME type is text, offer it in some other common formats.
-        if let Some(text_data_path) = text_data_path {
+        if let Some((original_text_mime, text_data)) = text_data {
             let text_mimes = [
                 "text/plain;charset=utf-8",
                 "text/plain",
@@ -896,15 +1052,29 @@ fn prepare_copy_internal(
                 "UTF8_STRING",
                 "TEXT",
             ];
-            for &mime_type in &text_mimes {
-                // We don't want to overwrite an explicit mime type, because it might be bound to a
-                // different data_path
-                if !data_paths.contains_key(mime_type) {
-                    data_paths.insert(mime_type.to_string(), text_data_path.clone());
-                }
+
+            // XXX: The code below optimizes for minimal fd duplication/cloning since
+            // they are more likely to become exhausted or cause issues then small memory allocations.
+
+            // We don't want to overwrite an explicit mime type, because it might be bound to a
+            // different `data_source`.
+            let sources_needed = text_mimes
+                .into_iter()
+                .chain(Some(original_text_mime.as_str()))
+                .filter(|mime| !data_sources.contains_key(*mime))
+                .collect::<HashSet<_>>();
+
+            let sources_count = sources_needed.len();
+            let mut sources = Vec::with_capacity(sources_count);
+            sources
+                .extend(std::iter::repeat_with(|| text_data.duplicate()).take(sources_count - 1));
+            sources.push(text_data);
+
+            for (mime_type, text_data) in sources_needed.into_iter().zip(sources) {
+                data_sources.insert(mime_type.to_string(), text_data);
             }
         }
-        data_paths
+        data_sources
     };
 
     // Create an iterator over (device, primary) for source creation later.
@@ -936,7 +1106,7 @@ fn prepare_copy_internal(
                 .clipboard_manager
                 .create_data_source(&queue.handle());
 
-            for mime_type in state.data_paths.keys() {
+            for mime_type in state.data_sources.keys() {
                 data_source.offer(mime_type.clone());
             }
 
