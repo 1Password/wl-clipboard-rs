@@ -173,12 +173,8 @@ pub enum SourceCreationError {
     TempFileTruncate(#[source] io::Error),
 
     #[cfg(feature = "memfd")]
-    #[error("Couldn't create the memfd file")]
-    MemFdFileCreate(#[source] memfd::Error),
-
-    #[cfg(feature = "memfd")]
-    #[error("Couldn't seal the memfd file")]
-    MemFdFileSeal(#[source] memfd::Error),
+    #[error("Couldn't create and setup the memfd file")]
+    MemFdFileCreate(#[source] io::Error),
 }
 
 /// Errors that can occur for copying and clearing the clipboard.
@@ -618,13 +614,21 @@ fn make_source(
 ) -> Result<FileSource, SourceCreationError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
-    use memfd::{FileSeal, Memfd, MemfdOptions};
+    use memfd::{Error, FileSeal, Memfd, MemfdOptions};
+
+    fn extract_fd_error(err: memfd::Error) -> SourceCreationError {
+        match err {
+            Error::Create(e) | Error::AddSeals(e) | Error::GetSeals(e) => {
+                SourceCreationError::MemFdFileCreate(e)
+            }
+        }
+    }
 
     let memfd_file = MemfdOptions::default()
         .allow_sealing(true)
         .close_on_exec(true)
         .create("wl-clipboard")
-        .map_err(SourceCreationError::MemFdFileCreate)?;
+        .map_err(extract_fd_error)?;
 
     let mut memfd_file = memfd_file.into_file();
     let mime_type = get_file_mime_type(&memfd_file, mime_type)?;
@@ -648,7 +652,7 @@ fn make_source(
             FileSeal::SealShrink,
             FileSeal::SealSeal,
         ])
-        .map_err(SourceCreationError::MemFdFileSeal)?;
+        .map_err(extract_fd_error)?;
 
     Ok(FileSource {
         mime_type,
