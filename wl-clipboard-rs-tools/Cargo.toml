@@ -35,3 +35,5 @@ native_lib = [
 dlopen = [
     "wl-clipboard-rs/dlopen",
 ]
+
+memfd = ["wl-clipboard-rs/memfd"]
