@@ -40,7 +40,6 @@ wayland-backend = "0.3.8"
 wayland-client = "0.31.8"
 wayland-protocols = { version = "0.32.6", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3.6", features = ["client"] }
-memfd = { version = "0.6", optional = true }
 
 [dev-dependencies]
 wayland-server = "0.31.7"
@@ -55,5 +54,6 @@ native_lib = ["wayland-backend/client_system", "wayland-backend/server_system"]
 
 dlopen = ["native_lib", "wayland-backend/dlopen", "wayland-backend/dlopen"]
 
-# Use an in-memory temporary file for copying
-memfd = ["dep:memfd"]
+# Use in-memory storage for serving clipboard contents instead of a temporary
+# file on disk.
+in-memory = []
