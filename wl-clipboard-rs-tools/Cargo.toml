@@ -36,4 +36,4 @@ dlopen = [
     "wl-clipboard-rs/dlopen",
 ]
 
-memfd = ["wl-clipboard-rs/memfd"]
+in-memory = ["wl-clipboard-rs/in-memory"]
