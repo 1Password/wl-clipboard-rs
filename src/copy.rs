@@ -3,14 +3,15 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs::{remove_dir_all, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
-use std::pin::Pin;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::mpsc::sync_channel;
+#[cfg(not(feature = "in-memory"))]
+use std::{fs::remove_dir_all, path::PathBuf};
+#[cfg(feature = "in-memory")]
+use std::{io::Cursor, sync::Arc};
 use std::{iter, thread};
 
-use log::trace;
 use rustix::fs::{fcntl_setfl, OFlags};
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -25,6 +26,8 @@ use crate::data_control::{
 };
 use crate::seat_data::SeatData;
 use crate::utils::is_text;
+
+const TEXT_PLAIN_MIME: &str = "text/plain";
 
 /// The clipboard to operate on.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash, PartialOrd, Ord, Default)]
@@ -171,10 +174,6 @@ pub enum SourceCreationError {
 
     #[error("Couldn't truncate the temporary file for newline trimming")]
     TempFileTruncate(#[source] io::Error),
-
-    #[cfg(feature = "memfd")]
-    #[error("Couldn't create and setup the memfd file")]
-    MemFdFileCreate(#[source] io::Error),
 }
 
 /// Errors that can occur for copying and clearing the clipboard.
@@ -253,25 +252,51 @@ struct State {
 }
 
 enum FileSourceInner {
-    #[cfg(feature = "memfd")]
-    InMemory(File),
-    TempFile {
-        file: File,
-        path: PathBuf,
-    },
+    #[cfg(feature = "in-memory")]
+    InMemory(Arc<[u8]>),
+    #[cfg(not(feature = "in-memory"))]
+    TempFile { file: File, path: PathBuf },
 }
 
 impl FileSourceInner {
     fn duplicate(&self) -> Self {
         match self {
-            #[cfg(feature = "memfd")]
-            Self::InMemory(file) => {
-                Self::InMemory(file.try_clone().expect("unable to clone FD we created"))
-            }
+            #[cfg(feature = "in-memory")]
+            Self::InMemory(contents) => Self::InMemory(Arc::clone(contents)),
+            #[cfg(not(feature = "in-memory"))]
             Self::TempFile { file, path } => Self::TempFile {
                 file: file.try_clone().expect("unable to clone FD we created"),
                 path: path.clone(),
             },
+        }
+    }
+
+    #[cfg(feature = "in-memory")]
+    fn perform_read_and_reset(
+        &mut self,
+        mut op: impl FnMut(&mut Cursor<&Arc<[u8]>>) -> Result<(), io::Error>,
+    ) -> Result<(), io::Error> {
+        let FileSourceInner::InMemory(inner) = &*self;
+        let mut cursor = Cursor::new(inner);
+
+        // No position reset needed, we use a new cursor each time.
+        op(&mut cursor)
+    }
+
+    #[cfg(not(feature = "in-memory"))]
+    fn perform_read_and_reset(
+        &mut self,
+        mut op: impl FnMut(&mut File) -> Result<(), io::Error>,
+    ) -> Result<(), io::Error> {
+        let FileSourceInner::TempFile { file: inner, .. } = self;
+
+        match op(inner) {
+            // Require the position to be reset after every operation for any
+            // future loop events.
+            Ok(()) => inner.rewind(),
+            // Everything is closed down after any I/O error, so the position the FD
+            // ends in doesn't matter.
+            Err(e) => Err(e),
         }
     }
 }
@@ -340,21 +365,16 @@ impl_dispatch_source!(State, |state: &mut Self,
             };
 
             let copy_result = || {
-                let source_file = match data_source {
-                    #[cfg(feature = "memfd")]
-                    FileSourceInner::InMemory(file) => file,
-                    FileSourceInner::TempFile { file, .. } => file,
-                };
                 // Clear O_NONBLOCK, otherwise io::copy() will stop halfway.
-                fcntl_setfl(&fd, OFlags::empty())
-                    .map_err(io::Error::from)
-                    .map_err(DataSourceError::Copy)?;
-
+                fcntl_setfl(&fd, OFlags::empty()).map_err(io::Error::from)?;
                 let mut target_file = File::from(fd);
-                io::copy(source_file, &mut target_file).map_err(DataSourceError::Copy)
+
+                data_source.perform_read_and_reset(|source_file| {
+                    io::copy(source_file, &mut target_file).map(drop)
+                })
             };
 
-            if let Err(err) = copy_result() {
+            if let Err(err) = copy_result().map_err(DataSourceError::Copy) {
                 state.error = Some(err);
             }
 
@@ -567,16 +587,18 @@ impl PreparedCopy {
         //
         // We want to try cleaning up all files and folders, so if any errors occur in process,
         // collect them into a vector without interruption, and then return the first one.
-        let mut results = Vec::new();
+        let mut results: Vec<Result<(), Error>> = Vec::new();
+        #[cfg(not(feature = "in-memory"))]
         let mut disk_source_dropped = HashSet::new();
         for data_source in self.state.data_sources.into_values() {
             match data_source {
-                // memfd is reference counted, there's no chance of closing something twice.
-                #[cfg(feature = "memfd")]
-                FileSourceInner::InMemory(file) => {
-                    drop(file);
+                // The contents are reference counted, there's no way to free them twice.
+                #[cfg(feature = "in-memory")]
+                FileSourceInner::InMemory(contents) => {
+                    drop(contents);
                     results.push(Ok(()));
                 }
+                #[cfg(not(feature = "in-memory"))]
                 FileSourceInner::TempFile { file, mut path } => {
                     drop(file);
                     path.pop();
@@ -606,151 +628,129 @@ impl PreparedCopy {
     }
 }
 
-#[cfg(feature = "memfd")]
+#[cfg(feature = "in-memory")]
 fn make_source(
     source: Source,
     mime_type: MimeType,
     trim_newline: bool,
 ) -> Result<FileSource, SourceCreationError> {
-    use std::os::fd::{FromRawFd, IntoRawFd};
-
-    use memfd::{Error, FileSeal, Memfd, MemfdOptions};
-
-    fn extract_fd_error(err: memfd::Error) -> SourceCreationError {
-        match err {
-            Error::Create(e) | Error::AddSeals(e) | Error::GetSeals(e) => {
-                SourceCreationError::MemFdFileCreate(e)
-            }
-        }
-    }
-
-    let memfd_file = MemfdOptions::default()
-        .allow_sealing(true)
-        .close_on_exec(true)
-        .create("wl-clipboard")
-        .map_err(extract_fd_error)?;
-
-    let mut memfd_file = memfd_file.into_file();
-    let mime_type = get_file_mime_type(&memfd_file, mime_type)?;
-    let pinned_file = PinnedFile {
-        inner: &mut memfd_file,
-        _pinned: std::marker::PhantomPinned,
+    let (mut output_place, written) = if let Source::Bytes(data) = source {
+        // Impossible to allocate more then a `u64` worth of data.
+        let written = data.len() as u64;
+        (data.into_vec(), written)
+    } else {
+        let contents = Vec::new();
+        let mut contents = Cursor::new(contents);
+        let written =
+            io::copy(&mut io::stdin(), &mut contents).map_err(SourceCreationError::DataCopy)?;
+        (contents.into_inner(), written)
     };
-    let pinned_file = std::pin::pin!(pinned_file);
 
-    write_source_to_file(source, trim_newline, pinned_file, &mime_type)?;
+    let mime_type = match mime_type {
+        MimeType::Autodetect => tree_magic_mini::from_u8(&output_place).to_string(),
+        MimeType::Text => TEXT_PLAIN_MIME.to_string(),
+        MimeType::Specific(mime_type) => mime_type,
+    };
 
-    // SAFETY: Created by `memfd` above and we know nothing in-between
-    // swapped out the underlying file descriptor.
-    #[allow(unsafe_code)]
-    let memfd_file = unsafe { Memfd::from_raw_fd(memfd_file.into_raw_fd()) };
-
-    memfd_file
-        .add_seals(&[
-            FileSeal::SealWrite,
-            FileSeal::SealGrow,
-            FileSeal::SealShrink,
-            FileSeal::SealSeal,
-        ])
-        .map_err(extract_fd_error)?;
+    let mut contents = Cursor::new(&output_place);
+    let updated_len = post_process_file_data(&mut contents, written, &mime_type, trim_newline)?;
+    output_place.truncate(updated_len as usize);
 
     Ok(FileSource {
         mime_type,
-        source: FileSourceInner::InMemory(memfd_file.into_file()),
+        source: FileSourceInner::InMemory(Arc::from(output_place)),
     })
 }
 
-#[cfg(not(feature = "memfd"))]
+#[cfg(not(feature = "in-memory"))]
 fn make_source(
     source: Source,
     mime_type: MimeType,
     trim_newline: bool,
 ) -> Result<FileSource, SourceCreationError> {
+    use std::io::Write;
+
+    fn perform_io_with_reset<T>(
+        output_file: &mut File,
+        op: impl FnOnce(&mut File) -> Result<T, SourceCreationError>,
+    ) -> Result<T, SourceCreationError> {
+        let result = op(output_file)?;
+        output_file
+            .rewind()
+            .map_err(SourceCreationError::TempFileSeek)?;
+        Ok(result)
+    }
+
     let temp_dir = tempfile::tempdir().map_err(SourceCreationError::TempDirCreate)?;
     let mut temp_filename = temp_dir.into_path();
     temp_filename.push("stdin");
-    trace!("Temp filename: {}", temp_filename.to_string_lossy());
+    log::trace!("Temp filename: {}", temp_filename.to_string_lossy());
+
     // Open the resulting FD as R+W so that both writing the source, and
     // later copying it out to a destination, work as intended.
-    let mut temp_file = std::fs::OpenOptions::new()
+    let mut output_file = std::fs::OpenOptions::new()
         .write(true)
         .read(true)
         .create(true)
         .truncate(true)
         .open(&temp_filename)
         .map_err(SourceCreationError::TempFileCreate)?;
-    let mime_type = get_file_mime_type(&temp_file, mime_type)?;
 
-    let pinned_file = PinnedFile {
-        inner: &mut temp_file,
-        _pinned: std::marker::PhantomPinned,
-    };
-    let pinned_file = std::pin::pin!(pinned_file);
+    let written = perform_io_with_reset(&mut output_file, |output_file| {
+        if let Source::Bytes(data) = &source {
+            output_file
+                .write_all(data)
+                .map_err(SourceCreationError::TempFileWrite)?;
+            // Impossible to write more then a `u64` worth of data.
+            Ok(data.len() as u64)
+        } else {
+            // Copy the standard input into the target file.
+            io::copy(&mut io::stdin(), output_file).map_err(SourceCreationError::DataCopy)
+        }
+    })?;
 
-    write_source_to_file(source, trim_newline, pinned_file, &mime_type)?;
+    let mime_type =
+        match mime_type {
+            MimeType::Autodetect => perform_io_with_reset(&mut output_file, |output_file| {
+                match tree_magic_mini::from_file(output_file) {
+                    Some(mime) => Ok(mime.to_string()),
+                    None => Err(SourceCreationError::TempFileOpen(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "problem with temp file",
+                    ))),
+                }
+            })?,
+            MimeType::Text => TEXT_PLAIN_MIME.to_string(),
+            MimeType::Specific(mime_type) => mime_type,
+        };
+
+    perform_io_with_reset(&mut output_file, |output_file| {
+        let updated_len = post_process_file_data(output_file, written, &mime_type, trim_newline)?;
+        output_file
+            .set_len(updated_len)
+            .map_err(SourceCreationError::TempFileTruncate)
+    })?;
+
     Ok(FileSource {
         mime_type,
         source: FileSourceInner::TempFile {
-            file: temp_file,
+            file: output_file,
             path: temp_filename,
         },
     })
 }
 
-fn get_file_mime_type(
-    source_file: &File,
-    mime_type: MimeType,
-) -> Result<String, SourceCreationError> {
-    let mime_type_str = match mime_type {
-        MimeType::Autodetect => match tree_magic_mini::from_file(source_file) {
-            Some(magic) => Ok(magic),
-            None => Err(SourceCreationError::TempFileOpen(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "problem with temp file",
-            ))),
-        }?
-        .to_string(),
-        MimeType::Text => "text/plain".to_string(),
-        MimeType::Specific(mime_type) => mime_type,
-    };
-    trace!("Base MIME type: {}", mime_type_str);
-    Ok(mime_type_str)
-}
-
-// A wrapper which helps force proper `unsafe` annotations
-// to ensure FDs don't get swapped out by `write_source_to_file`
-// in order to soundly re-consume the FD after.
-struct PinnedFile<'a> {
-    inner: &'a mut File,
-    _pinned: std::marker::PhantomPinned,
-}
-
-fn write_source_to_file(
-    source: Source,
-    trim_newline: bool,
-    output_place: Pin<&mut PinnedFile>,
+fn post_process_file_data(
+    output_place: &mut (impl Read + Seek),
+    mut written: u64,
     mime_type: &str,
-) -> Result<(), SourceCreationError> {
-    // SAFETY: We only write to the file, we never replace it.
-    #[allow(unsafe_code)]
-    let output_place = unsafe { &mut *output_place.get_unchecked_mut().inner };
-
-    if let Source::Bytes(data) = source {
-        output_place
-            .write_all(&data)
-            .map_err(SourceCreationError::TempFileWrite)?;
-    } else {
-        // Copy the standard input into the target file.
-        io::copy(&mut io::stdin(), output_place).map_err(SourceCreationError::DataCopy)?;
-    }
-
+    trim_newline: bool,
+) -> Result<u64, SourceCreationError> {
     // Trim the trailing newline if needed.
     if trim_newline && is_text(mime_type) {
-        let metadata = output_place
-            .metadata()
-            .map_err(SourceCreationError::TempFileMetadata)?;
-        let length = metadata.len();
-        if length > 0 {
+        // XXX: The number of bytes we wrote to `output_place` is the same as its length because
+        // a new file is always passed in when this function is called, which has no previous data.
+        if written > 0 {
             output_place
                 .seek(SeekFrom::End(-1))
                 .map_err(SourceCreationError::TempFileSeek)?;
@@ -759,20 +759,13 @@ fn write_source_to_file(
             output_place
                 .read_exact(&mut buf)
                 .map_err(SourceCreationError::TempFileRead)?;
+
             if buf[0] == b'\n' {
-                output_place
-                    .set_len(length - 1)
-                    .map_err(SourceCreationError::TempFileTruncate)?;
+                written -= 1;
             }
         }
     }
-
-    // Restore its offset to the start so that
-    // future reads see the previously-written data.
-    output_place
-        .seek(SeekFrom::Start(0))
-        .map(drop)
-        .map_err(SourceCreationError::TempFileSeek)
+    Ok(written)
 }
 
 fn get_devices(
@@ -1019,8 +1012,9 @@ fn prepare_copy_internal(
                 Entry::Occupied(_) => {
                     // This MIME type has already been specified, so ignore it.
                     match source {
-                        #[cfg(feature = "memfd")]
-                        FileSourceInner::InMemory(file) => drop(file),
+                        #[cfg(feature = "in-memory")]
+                        FileSourceInner::InMemory(contents) => drop(contents),
+                        #[cfg(not(feature = "in-memory"))]
                         FileSourceInner::TempFile { file, mut path, .. } => {
                             // Be explicit during cleanup.
                             drop(file);
@@ -1047,7 +1041,7 @@ fn prepare_copy_internal(
         if let Some((original_text_mime, text_data)) = text_data {
             let text_mimes = [
                 "text/plain;charset=utf-8",
-                "text/plain",
+                TEXT_PLAIN_MIME,
                 "STRING",
                 "UTF8_STRING",
                 "TEXT",
